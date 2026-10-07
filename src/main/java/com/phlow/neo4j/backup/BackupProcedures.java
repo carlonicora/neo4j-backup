@@ -64,6 +64,34 @@ public class BackupProcedures {
         }
     }
 
+    /**
+     * Like backup.database, into server.backup.directory/fileName. An existing named pipe there is
+     * written to (streaming, no disk) and never deleted; a missing target becomes a regular file.
+     */
+    @Admin
+    @Procedure(name = "backup.databaseTo", mode = Mode.DBMS)
+    @Description("Consistent online backup of one database into server.backup.directory/fileName; "
+            + "an existing named pipe there is streamed into")
+    public Stream<Output> databaseTo(@Name("name") String name, @Name("fileName") String fileName) {
+        HotBackup.validateFileName(fileName);
+        DatabaseManagementService dbms = dbms();
+        GraphDatabaseAPI target = (GraphDatabaseAPI) dbms.database(name);
+        if (!target.isAvailable(0)) {
+            throw new IllegalStateException("Database '" + name + "' is not available");
+        }
+        try {
+            HotBackup.Result r = hotBackup().runTo(target, fileName);
+            log.info("Hot backup of '%s' written to %s", name, r.path());
+            return Stream.of(new Output(r.database(), r.path().toString(), r.bytes(), r.millis(), "ok"));
+        } catch (IOException e) {
+            log.error("Hot backup of '" + name + "' failed", e);
+            throw new RuntimeException(e.getMessage(), e);
+        } catch (RuntimeException e) {
+            log.error("Hot backup of '" + name + "' failed", e);
+            throw e;
+        }
+    }
+
     /** One row per database; a failure of one database is reported in its row, never thrown. */
     @Admin
     @Procedure(name = "backup.all", mode = Mode.DBMS)

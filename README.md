@@ -18,10 +18,13 @@ It writes a standard `.dump` file that `neo4j-admin database load` reads. Design
 
 ## Procedures
 
-Both are admin-only.
+All three are admin-only.
 
 ```
 CALL backup.database(name :: STRING)
+  YIELD database, path, bytes, millis, status
+
+CALL backup.databaseTo(name :: STRING, fileName :: STRING)
   YIELD database, path, bytes, millis, status
 
 CALL backup.all()
@@ -29,8 +32,10 @@ CALL backup.all()
 ```
 
 - `database`: database name.
-- `path`: the file written, `<dir>/<database>-<yyyyMMdd-HHmmss>.dump`.
-- `bytes`: size of the file.
+- `path`: the file written, `<dir>/<database>-<yyyyMMdd-HHmmss>.dump` (for `backup.databaseTo`,
+  `<dir>/<fileName>`).
+- `bytes`: bytes written to the output, i.e. the compressed archive. For a regular file this equals
+  the file size.
 - `millis`: time taken.
 - `status`: exactly one of `ok`, `skipped: not available`, `failed: <message>`. The last two
   have null `path`, `bytes` and `millis`.
@@ -40,6 +45,32 @@ not started. The caller must check `status` on every row. `backup.database()` th
 unknown or failed database.
 
 A second backup of the same database in the same second fails rather than overwrite the first.
+
+### backup.databaseTo: fixed name, or streaming through a named pipe
+
+`backup.databaseTo(name, fileName)` behaves like `backup.database` (one `ok` row, throws on
+failure) but writes to `server.backup.directory/fileName`. `fileName` must be a plain file name:
+empty, `.`, `..` or anything containing `/` or `\` is rejected before the database is touched.
+
+- Target missing: a new regular file, as `backup.database` writes it (fsynced, deleted on failure).
+- Target is an existing regular file: fails, nothing is overwritten.
+- Target is an existing named pipe (FIFO) or other non-regular file: opened for writing only, no
+  fsync, and never deleted, not even on failure. Whoever created the pipe owns it.
+
+The pipe case lets a backup go straight to S3 without the dump ever touching the disk:
+
+```
+mkfifo /var/lib/neo4j/backups/neo4j.fifo
+aws s3 cp - s3://bucket/neo4j-$(date +%Y%m%d-%H%M%S).dump < /var/lib/neo4j/backups/neo4j.fifo &
+cypher-shell -u neo4j "CALL backup.databaseTo('neo4j', 'neo4j.fifo')"
+wait; rm /var/lib/neo4j/backups/neo4j.fifo
+```
+
+Start the reader first. Opening a pipe for writing blocks until a reader has it open. The
+procedure opens the output before the checkpoint and the store-copy lock, so checkpoints never
+wait on it, and gives up after 60 s with `no reader opened <path> within 60.0 s`. If the
+reader dies mid-stream the write fails with an I/O error (broken pipe) and the procedure throws;
+the pipe is left in place.
 
 ## Restore
 

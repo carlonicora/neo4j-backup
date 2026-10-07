@@ -13,6 +13,10 @@ import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Predicate;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
@@ -26,24 +30,110 @@ public final class DumpArchiveWriter implements AutoCloseable {
     private static final int BUFFER_SIZE = 64 * 1024;
 
     private final FileChannel channel;
+    private final boolean ownsFile;
     private final OutputStream compressed;
     private final TarArchiveOutputStream tar;
     private final byte[] buffer = new byte[BUFFER_SIZE];
     private long filesWritten;
     private long bytesWritten;
+    private long archiveBytes;
     private boolean closed;
+
+    /** The opened archive output: a channel, and whether this plugin created the file (and may delete it). */
+    public record Target(Path path, FileChannel channel, boolean ownsFile) {}
 
     /** Opens archive with CREATE_NEW, wraps in StandardCompressionFormat.ZSTD.compress, writes
      *  DataOutputStream int 1, long expectedFiles, long expectedBytes, then opens a
      *  TarArchiveOutputStream with LONGFILE_POSIX and BIGNUMBER_POSIX. */
     public DumpArchiveWriter(Path archive, long expectedFiles, long expectedBytes) throws IOException {
-        this.channel = FileChannel.open(archive, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+        this(openTarget(archive, false, 0), expectedFiles, expectedBytes);
+    }
+
+    /**
+     * Opens the archive output without writing anything. A missing archive is created (CREATE_NEW).
+     * With allowPipe, an existing non-regular file (a named pipe) is opened for WRITE only; that open
+     * blocks until a reader opens the pipe, so it runs on its own thread and fails with an IOException
+     * after pipeTimeoutMillis. An existing regular file always fails.
+     */
+    public static Target openTarget(Path archive, boolean allowPipe, long pipeTimeoutMillis) throws IOException {
+        if (allowPipe && Files.exists(archive) && !Files.isRegularFile(archive)) {
+            return new Target(archive, openPipe(archive, pipeTimeoutMillis), false);
+        }
+        return new Target(archive,
+                FileChannel.open(archive, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE), true);
+    }
+
+    private static FileChannel openPipe(Path pipe, long timeoutMillis) throws IOException {
+        CompletableFuture<FileChannel> opened = new CompletableFuture<>();
+        Thread opener = new Thread(() -> {
+            try {
+                FileChannel channel = FileChannel.open(pipe, StandardOpenOption.WRITE);
+                if (!opened.complete(channel)) {
+                    channel.close(); // the caller gave up: never leak the channel
+                }
+            } catch (Throwable e) {
+                opened.completeExceptionally(e);
+            }
+        }, "hot-backup-pipe-open");
+        opener.setDaemon(true);
+        opener.start();
+        boolean interrupted = false;
+        try {
+            return opened.get(timeoutMillis, TimeUnit.MILLISECONDS);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException io) {
+                throw io;
+            }
+            throw new IOException("Opening " + pipe + " failed: " + cause, cause);
+        } catch (TimeoutException | InterruptedException e) {
+            interrupted = e instanceof InterruptedException;
+            String message = interrupted
+                    ? "Interrupted waiting for a reader to open " + pipe
+                    : "no reader opened " + pipe + " within " + timeoutMillis / 1000.0 + " s";
+            IOException failure = new IOException(message, e);
+            if (!opened.completeExceptionally(failure)) {
+                return opened.join(); // the open won the race: use it
+            }
+            releaseOpener(pipe);
+            throw failure;
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /** Unblocks the abandoned open: a read-write open of a FIFO never blocks and counts as a reader,
+     *  so the opener's open returns and it closes its channel. Best effort. */
+    private static void releaseOpener(Path pipe) {
+        try (FileChannel ignored = FileChannel.open(pipe, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            // nothing to do
+        } catch (IOException | RuntimeException ignored) {
+            // the opener stays parked as a daemon thread; it closes its channel if it ever opens
+        }
+    }
+
+    /** Takes ownership of target's channel and writes the dump header. On failure closes the channel
+     *  and deletes the file if this plugin created it; a pipe is never deleted. */
+    public DumpArchiveWriter(Target target, long expectedFiles, long expectedBytes) throws IOException {
+        Path archive = target.path();
+        this.ownsFile = target.ownsFile();
+        this.channel = target.channel();
         try {
             // The zstd stream must not close the channel: close() forces it to disk first.
+            // Counts every byte handed to the channel, i.e. the size of the compressed archive.
             OutputStream channelOut = new FilterOutputStream(Channels.newOutputStream(channel)) {
+                @Override
+                public void write(int b) throws IOException {
+                    out.write(b);
+                    archiveBytes++;
+                }
+
                 @Override
                 public void write(byte[] b, int off, int len) throws IOException {
                     out.write(b, off, len);
+                    archiveBytes += len;
                 }
 
                 @Override
@@ -60,19 +150,32 @@ public final class DumpArchiveWriter implements AutoCloseable {
             this.tar.setLongFileMode(TarArchiveOutputStream.LONGFILE_POSIX);
             this.tar.setBigNumberMode(TarArchiveOutputStream.BIGNUMBER_POSIX);
         } catch (IOException | RuntimeException | Error e) {
-            // CREATE_NEW succeeded, so the file is ours: remove it rather than leave a broken archive.
             try {
                 channel.close();
             } catch (IOException suppressed) {
                 e.addSuppressed(suppressed);
             }
-            try {
-                Files.deleteIfExists(archive);
-            } catch (IOException suppressed) {
-                e.addSuppressed(suppressed);
+            // CREATE_NEW succeeded, so the file is ours: remove it rather than leave a broken archive.
+            // A pipe belongs to whoever created it and is never deleted.
+            if (ownsFile) {
+                try {
+                    Files.deleteIfExists(archive);
+                } catch (IOException suppressed) {
+                    e.addSuppressed(suppressed);
+                }
             }
             throw e;
         }
+    }
+
+    /** True when this writer created the archive as a regular file (delete it on failure); false for a pipe. */
+    public boolean ownsFile() {
+        return ownsFile;
+    }
+
+    /** Bytes written to the archive output (the compressed stream). Final once close() returned. */
+    public long archiveBytes() {
+        return archiveBytes;
     }
 
     /** Walks root depth-first (Files.walkFileTree). Adds a directory entry for root ("./") and
@@ -142,7 +245,7 @@ public final class DumpArchiveWriter implements AutoCloseable {
         return bytesWritten;
     }
 
-    /** Finishes the tar, closes the zstd stream, fsyncs on success, and always closes the channel. */
+    /** Finishes the tar, closes the zstd stream, fsyncs a regular file on success, always closes the channel. */
     @Override
     public void close() throws IOException {
         if (closed) {
@@ -156,7 +259,7 @@ public final class DumpArchiveWriter implements AutoCloseable {
         } finally {
             try {
                 compressed.close();
-                if (finished) {
+                if (finished && ownsFile) {
                     channel.force(true);
                 }
             } finally {

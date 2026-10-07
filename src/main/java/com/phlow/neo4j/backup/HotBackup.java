@@ -48,23 +48,54 @@ public final class HotBackup {
     private static final DateTimeFormatter STAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
     private static final long CLOSE_WAIT_MILLIS = 60_000;
     private static final long CLOSE_POLL_MILLIS = 10;
+    static final long PIPE_OPEN_WAIT_MILLIS = 60_000;
 
     private final Path backupDirectory;
     private final Clock clock;
     private final InternalLog log;
+    private final long pipeOpenWaitMillis;
 
     public HotBackup(Path backupDirectory, Clock clock, InternalLog log) {
+        this(backupDirectory, clock, log, PIPE_OPEN_WAIT_MILLIS);
+    }
+
+    /** pipeOpenWaitMillis: how long runTo waits for a reader to open a named pipe target. */
+    HotBackup(Path backupDirectory, Clock clock, InternalLog log, long pipeOpenWaitMillis) {
         this.backupDirectory = backupDirectory;
         this.clock = clock;
         this.log = log;
+        this.pipeOpenWaitMillis = pipeOpenWaitMillis;
     }
 
     static String fileName(String database, Instant now, ZoneId zone) {
         return database + "-" + STAMP.format(now.atZone(zone)) + ".dump";
     }
 
-    /** Steps 1 to 5 of the spec for one started database. */
+    /** Rejects anything but a plain file name: empty, ".", "..", or containing a slash or backslash. */
+    static void validateFileName(String fileName) {
+        if (fileName == null || fileName.isEmpty() || fileName.equals(".") || fileName.equals("..")
+                || fileName.indexOf('/') >= 0 || fileName.indexOf('\\') >= 0) {
+            throw new IllegalArgumentException(
+                    "fileName must be a plain file name inside server.backup.directory, got: '" + fileName + "'");
+        }
+    }
+
+    /** Steps 1 to 5 of the spec for one started database, into a new timestamped .dump file. */
     public Result run(GraphDatabaseAPI target) throws IOException {
+        return run(target, null);
+    }
+
+    /**
+     * Like {@link #run(GraphDatabaseAPI)}, into server.backup.directory/fileName. A missing target is
+     * created as a regular file; an existing non-regular file (a named pipe) is written to and never
+     * deleted; an existing regular file fails.
+     */
+    public Result runTo(GraphDatabaseAPI target, String fileName) throws IOException {
+        validateFileName(fileName);
+        return run(target, fileName);
+    }
+
+    private Result run(GraphDatabaseAPI target, String fixedFileName) throws IOException {
         // 1. Directory check, before touching the database.
         if (!Files.isDirectory(backupDirectory) || !Files.isWritable(backupDirectory)) {
             throw new IOException("server.backup.directory is not a writable directory: " + backupDirectory);
@@ -83,14 +114,22 @@ public final class HotBackup {
         String name = layout.getDatabaseName();
 
         // 3. Target archive.
-        Path archive = backupDirectory.resolve(fileName(name, clock.instant(), ZoneId.systemDefault()));
+        Path archive = backupDirectory.resolve(
+                fixedFileName != null ? fixedFileName : fileName(name, clock.instant(), ZoneId.systemDefault()));
         log.info("Hot backup of '%s' started, target %s", name, archive);
+
+        // Open the output before the checkpoint and the store-copy lock: opening a pipe waits for its
+        // reader, and checkpoints must never wait on that.
+        DumpArchiveWriter.Target output =
+                DumpArchiveWriter.openTarget(archive, fixedFileName != null, pipeOpenWaitMillis);
+        // A pipe is owned by whoever created it: never delete it.
+        boolean archiveCreated = output.ownsFile();
 
         // 4. Checkpoint under the store-copy mutex; checkpoints stay blocked until the lock is closed.
         StoreCopyCheckPointMutex mutex = database.getStoreCopyCheckPointMutex();
         long[] appendIndex = new long[1];
         LogPosition bound;
-        boolean archiveCreated = false;
+        long bytes;
         try (Resource lock = mutex.storeCopy(
                 () -> appendIndex[0] = checkPointer.tryCheckPoint(new SimpleTriggerInfo("hot backup")))) {
             log.info("Hot backup of '%s': checkpoint done at append index %d", name, appendIndex[0]);
@@ -124,8 +163,7 @@ public final class HotBackup {
                     expectedBytes += Files.size(f);
                 }
 
-                DumpArchiveWriter writer = new DumpArchiveWriter(archive, expectedFiles, expectedBytes);
-                archiveCreated = true;
+                DumpArchiveWriter writer = new DumpArchiveWriter(output, expectedFiles, expectedBytes);
                 try (writer) {
                     writeStoreFiles(writer, dbDir, storeFiles);
                     log.info("Hot backup of '%s': store files written, %d files, %d bytes",
@@ -145,8 +183,14 @@ public final class HotBackup {
                     log.info("Hot backup of '%s': transaction logs written, %d files, %d bytes",
                             name, writer.filesWritten() - storeCount, writer.bytesWritten() - storeBytes);
                 }
+                bytes = writer.archiveBytes();
             }
         } catch (IOException | RuntimeException | Error e) {
+            try {
+                output.channel().close(); // no-op if the writer already closed it
+            } catch (IOException suppressed) {
+                e.addSuppressed(suppressed);
+            }
             if (archiveCreated) {
                 try {
                     Files.deleteIfExists(archive);
@@ -158,7 +202,6 @@ public final class HotBackup {
         }
 
         long millis = (System.nanoTime() - started) / 1_000_000;
-        long bytes = Files.size(archive);
         log.info("Hot backup of '%s' finished in %d ms, %s (%d bytes)", name, millis, archive, bytes);
         return new Result(name, archive, bytes, millis, appendIndex[0], bound.getLogVersion(), bound.getByteOffset());
     }

@@ -3,6 +3,9 @@ package com.phlow.neo4j.backup;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
+
+import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -15,6 +18,7 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -25,6 +29,7 @@ import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.neo4j.dbms.api.DatabaseManagementService;
 import org.neo4j.dbms.api.DatabaseManagementServiceBuilder;
@@ -35,6 +40,8 @@ import org.neo4j.io.fs.DefaultFileSystemAbstraction;
 import org.neo4j.io.layout.DatabaseLayout;
 import org.neo4j.io.layout.Neo4jLayout;
 import org.neo4j.kernel.api.procedure.GlobalProcedures;
+import org.neo4j.kernel.impl.transaction.log.checkpoint.CheckPointer;
+import org.neo4j.kernel.impl.transaction.log.checkpoint.SimpleTriggerInfo;
 import org.neo4j.kernel.internal.GraphDatabaseAPI;
 import org.neo4j.logging.NullLog;
 
@@ -221,6 +228,172 @@ class HotBackupTest {
         }
         assertThat(highestVersion).isEqualTo(r.logBoundVersion());
         assertThat(highestSize).isEqualTo(r.logBoundOffset());
+    }
+
+    @Test
+    void procedureDatabaseToRejectsNonPlainFileNamesBeforeTouchingDatabase() throws Exception {
+        for (String bad : List.of("", ".", "..", "a/b.dump", "../x.dump", "/abs.dump", "a\\b.dump")) {
+            // Unknown database: the fileName error must come first.
+            assertThatThrownBy(() -> api.executeTransactionally(
+                            "CALL backup.databaseTo($n, $f)", Map.of("n", "nope", "f", bad), r -> r.stream().toList()))
+                    .as("fileName '%s'", bad)
+                    .hasMessageContaining("fileName must be a plain file name");
+        }
+        try (Stream<Path> files = Files.list(backups)) {
+            assertThat(files.toList()).isEmpty();
+        }
+    }
+
+    @Test
+    void procedureDatabaseToWritesRegularFileAndBytesEqualsFileSize() throws Exception {
+        api.executeTransactionally("UNWIND range(1, 100) AS i CREATE (:T {i: i})");
+
+        List<Map<String, Object>> rows = api.executeTransactionally(
+                "CALL backup.databaseTo($n, $f)", Map.of("n", "neo4j", "f", "fixed.dump"), r -> r.stream().toList());
+
+        assertThat(rows).hasSize(1);
+        Map<String, Object> row = rows.get(0);
+        Path path = backups.resolve("fixed.dump");
+        assertThat(row.get("database")).isEqualTo("neo4j");
+        assertThat(row.get("status")).isEqualTo("ok");
+        assertThat(row.get("path")).isEqualTo(path.toString());
+        assertThat(Files.isRegularFile(path)).isTrue();
+        assertThat((Long) row.get("bytes")).isEqualTo(Files.size(path));
+        assertThat(countT(restore(path))).isEqualTo(100);
+    }
+
+    @Test
+    void procedureDatabaseToExistingRegularFileFailsAndKeepsIt() throws Exception {
+        Path path = backups.resolve("taken.dump");
+        Files.writeString(path, "x");
+
+        assertThatThrownBy(() -> api.executeTransactionally(
+                        "CALL backup.databaseTo($n, $f)", Map.of("n", "neo4j", "f", "taken.dump"),
+                        r -> r.stream().toList()))
+                .hasMessageContaining("taken.dump");
+
+        assertThat(Files.readString(path)).isEqualTo("x");
+    }
+
+    @Test
+    @Timeout(120)
+    void procedureDatabaseToStreamsIntoFifoAndLeavesIt() throws Exception {
+        api.executeTransactionally("UNWIND range(1, 100) AS i CREATE (:T {i: i})");
+        Path fifo = mkfifo(backups.resolve("stream.dump"));
+
+        CompletableFuture<byte[]> read = CompletableFuture.supplyAsync(() -> {
+            try (InputStream in = Files.newInputStream(fifo)) {
+                ByteArrayOutputStream out = new ByteArrayOutputStream();
+                in.transferTo(out);
+                return out.toByteArray();
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        List<Map<String, Object>> rows = api.executeTransactionally(
+                "CALL backup.databaseTo($n, $f)", Map.of("n", "neo4j", "f", "stream.dump"), r -> r.stream().toList());
+        byte[] bytes = read.get(60, TimeUnit.SECONDS);
+
+        assertThat(rows).hasSize(1);
+        assertThat(rows.get(0).get("status")).isEqualTo("ok");
+        assertThat(rows.get(0).get("path")).isEqualTo(fifo.toString());
+        assertThat((Long) rows.get(0).get("bytes")).isEqualTo(bytes.length).isGreaterThan(0);
+        assertThat(fifo).exists();
+        assertThat(Files.isRegularFile(fifo)).isFalse();
+
+        Path copy = restoreHome.resolve("stream.dump");
+        Files.write(copy, bytes);
+        assertThat(countT(restore(copy))).isEqualTo(100);
+    }
+
+    @Test
+    @Timeout(120)
+    void procedureDatabaseToFailsWhenFifoReaderClosesEarlyAndLeavesFifo() throws Exception {
+        // Enough incompressible data that the archive cannot fit in the pipe buffer.
+        api.executeTransactionally(
+                "UNWIND range(1, 20000) AS i CREATE (:T {a: randomUUID(), b: randomUUID(), c: randomUUID()})");
+        Path fifo = mkfifo(backups.resolve("stream.dump"));
+
+        CompletableFuture<Integer> read = CompletableFuture.supplyAsync(() -> {
+            try (InputStream in = Files.newInputStream(fifo)) {
+                return in.read(); // blocks until the backup has started writing, then the reader dies
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        assertThatThrownBy(() -> api.executeTransactionally(
+                        "CALL backup.databaseTo($n, $f)", Map.of("n", "neo4j", "f", "stream.dump"),
+                        r -> r.stream().toList()))
+                .hasRootCauseInstanceOf(IOException.class);
+        assertThat(read.get(60, TimeUnit.SECONDS)).isNotEqualTo(-1);
+        assertThat(fifo).exists();
+        assertThat(Files.isRegularFile(fifo)).isFalse();
+
+        // The database is unharmed and a normal backup still works afterwards.
+        List<Map<String, Object>> rows = api.executeTransactionally(
+                "CALL backup.database($n)", Map.of("n", "neo4j"), r -> r.stream().toList());
+        assertThat(rows.get(0).get("status")).isEqualTo("ok");
+    }
+
+    @Test
+    @Timeout(60)
+    void fifoWithoutReaderFailsWithinTimeoutAndDatabaseKeepsCheckpointing() throws Exception {
+        Path fifo = mkfifo(backups.resolve("stream.dump"));
+        HotBackup hot = new HotBackup(backups, Clock.systemUTC(), NullLog.getInstance(), 1000);
+
+        long t0 = System.nanoTime();
+        assertThatThrownBy(() -> hot.runTo(api, "stream.dump"))
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("no reader opened " + fifo + " within 1.0 s");
+        long elapsedMillis = (System.nanoTime() - t0) / 1_000_000;
+
+        assertThat(elapsedMillis).isBetween(900L, 10_000L);
+        assertThat(fifo).exists();
+        assertThat(Files.isRegularFile(fifo)).isFalse();
+
+        // The abandoned open is released and does not linger holding the pipe.
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (pipeOpenerAlive() && System.nanoTime() < deadline) {
+            Thread.sleep(20);
+        }
+        assertThat(pipeOpenerAlive()).isFalse();
+
+        // Checkpoints and backups on the same database still work.
+        api.executeTransactionally("CREATE (:T {i: 1})");
+        api.getDependencyResolver().resolveDependency(CheckPointer.class)
+                .forceCheckPoint(new SimpleTriggerInfo("test"));
+        List<Map<String, Object>> rows = api.executeTransactionally(
+                "CALL backup.database($n)", Map.of("n", "neo4j"), r -> r.stream().toList());
+        assertThat(rows.get(0).get("status")).isEqualTo("ok");
+    }
+
+    private static boolean pipeOpenerAlive() {
+        return Thread.getAllStackTraces().keySet().stream()
+                .anyMatch(t -> t.isAlive() && t.getName().equals("hot-backup-pipe-open"));
+    }
+
+    private static Path mkfifo(Path path) throws Exception {
+        int exit;
+        try {
+            exit = new ProcessBuilder("mkfifo", path.toString()).inheritIO().start().waitFor();
+        } catch (IOException e) {
+            exit = -1;
+        }
+        assumeTrue(exit == 0, "mkfifo unavailable");
+        return path;
+    }
+
+    private static long countT(Path home) {
+        DatabaseManagementService restored = new DatabaseManagementServiceBuilder(home).build();
+        try {
+            return restored.database("neo4j")
+                    .executeTransactionally("MATCH (n:T) RETURN count(n) AS c", Map.of(),
+                            res -> (Long) res.next().get("c"));
+        } finally {
+            restored.shutdown();
+        }
     }
 
     private Path restore(Path archive) throws Exception {

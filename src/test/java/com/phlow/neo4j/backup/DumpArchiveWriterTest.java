@@ -64,6 +64,8 @@ class DumpArchiveWriterTest {
         assertThat(Files.readString(layout.getTransactionLogsDirectory().resolve("checkpoint.0"))).isEqualTo("cp");
         assertThat(writer.filesWritten()).isEqualTo(4);
         assertThat(writer.bytesWritten()).isEqualTo(5 + 3 + 4 + 2);
+        assertThat(writer.archiveBytes()).isEqualTo(Files.size(archive));
+        assertThat(writer.ownsFile()).isTrue();
     }
 
     @Test void excludedFilesAreNotArchived() throws Exception {
@@ -150,6 +152,14 @@ class DumpArchiveWriterTest {
         Path archive = tmp.resolve("out.dump");
         Files.writeString(archive, "x");
         assertThatThrownBy(() -> new DumpArchiveWriter(archive, 0, 0))
+                .isInstanceOf(FileAlreadyExistsException.class);
+        assertThat(Files.readString(archive)).isEqualTo("x");
+    }
+
+    @Test void openTargetRefusesExistingRegularFileEvenWithPipesAllowed() throws Exception {
+        Path archive = tmp.resolve("out.dump");
+        Files.writeString(archive, "x");
+        assertThatThrownBy(() -> DumpArchiveWriter.openTarget(archive, true, 1000))
                 .isInstanceOf(FileAlreadyExistsException.class);
         assertThat(Files.readString(archive)).isEqualTo("x");
     }
